@@ -20,7 +20,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Configure Gemini API
-API_KEY = "AIzaSyDD8QW1BggDVVMLteDygHCHrD6Ff9Dy0e8"
+API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDD8QW1BggDVVMLteDygHCHrD6Ff9Dy0e8")
 genai.configure(api_key=API_KEY)
 model = genai.GenerativeModel("gemini-1.5-pro")
 
@@ -53,6 +53,7 @@ def get_similarity(img1_path, img2_path):
 def segment_webpage(url, segment_type, url_index):
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()))
     try:
+        logging.debug(f"Fetching URL: {url} for {segment_type}")
         driver.get(url)
         screenshot = driver.get_screenshot_as_png()
         with open(TEMP_IMAGE_PATH, "wb") as f:
@@ -68,14 +69,20 @@ def segment_webpage(url, segment_type, url_index):
         
         output_path = os.path.join(INPUT_PATH, segment_type, f"url{url_index + 1}_{segment_type}.jpg")
         cropped.save(output_path, "JPEG")
+        logging.debug(f"Saved screenshot to {output_path}")
         return output_path
+    except Exception as e:
+        logging.error(f"Selenium error for {url}: {e}")
+        return None
     finally:
         driver.quit()
 
 def process_urls(url_list):
     for i, url in enumerate(url_list):
         for section in SECTIONS:
-            segment_webpage(url, section, i)
+            result = segment_webpage(url, section, i)
+            if result is None:
+                logging.warning(f"Failed to process {section} for {url}")
 
 def find_best_matches_per_section():
     final_results = {}
@@ -83,8 +90,9 @@ def find_best_matches_per_section():
 
     for section in SECTIONS:
         similarities_per_url = {f"url{i+1}": {'best_match': None, 'best_score': 0, 'image_path': None} for i in range(3)}
-
         dataset_dir = os.path.join(DATASET_PATH, section)
+        logging.debug(f"Checking dataset directory: {dataset_dir}, files: {os.listdir(dataset_dir) if os.path.exists(dataset_dir) else []}")
+
         if not os.path.exists(dataset_dir) or not os.listdir(dataset_dir):
             logging.warning(f"No dataset images found in {dataset_dir}")
             for i in range(3):
@@ -93,6 +101,7 @@ def find_best_matches_per_section():
             for i in range(3):
                 input_img = os.path.join(INPUT_PATH, section, f"url{i+1}_{section}.jpg")
                 if not os.path.exists(input_img):
+                    logging.warning(f"Input image not found: {input_img}")
                     continue
                 best_score = 0
                 best_match = None
@@ -117,7 +126,11 @@ def find_best_matches_per_section():
 
     for section, image_path in best_images.items():
         dest_path = os.path.join(BEST_IMAGES_PATH, f"best_{section}.jpg")
-        shutil.copy(image_path, dest_path)
+        logging.debug(f"Copying {image_path} to {dest_path}")
+        try:
+            shutil.copy(image_path, dest_path)
+        except Exception as e:
+            logging.error(f"Error copying {image_path} to {dest_path}: {e}")
 
     # Safely clean up input directories
     for section in SECTIONS:
@@ -132,12 +145,27 @@ def find_best_matches_per_section():
     return final_results, best_images
 
 def encode_image(image_path):
-    with open(image_path, "rb") as image_file:
-        image_data = image_file.read()
-    return base64.b64encode(image_data).decode("utf-8")
+    try:
+        with Image.open(image_path) as img:
+            img = img.resize((800, 600))  # Resize to reduce memory usage
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG")
+            image_data = buffer.getvalue()
+        return base64.b64encode(image_data).decode("utf-8")
+    except Exception as e:
+        logging.error(f"Error encoding image {image_path}: {e}")
+        raise
 
 def generate_suggestions(image_path, section_type, website_type="e-commerce"):
     try:
+        if not os.path.exists(image_path):
+            logging.error(f"Image not found: {image_path}")
+            return {
+                "website_type": website_type,
+                "section_type": section_type,
+                "suggestions": []
+            }
+
         image_base64 = encode_image(image_path)
         mime_type = "image/jpeg"
 
@@ -164,7 +192,17 @@ def generate_suggestions(image_path, section_type, website_type="e-commerce"):
             }
         ]
 
+        logging.debug(f"Sending Gemini API request for {section_type}")
         response = model.generate_content(content)
+        logging.debug(f"Gemini API response: {response}")
+        if not hasattr(response, 'text') or response.text is None:
+            logging.error(f"Gemini API returned no text for {section_type}")
+            return {
+                "website_type": website_type,
+                "section_type": section_type,
+                "suggestions": []
+            }
+
         suggestions_text = response.text.strip()
         suggestions_list = [line.strip() for line in suggestions_text.split("\n") if line.strip().startswith(tuple("123456789"))]
         
@@ -207,10 +245,18 @@ def process_urls_api():
 
         suggestions_results = []
         for section in SECTIONS:
-            if section in best_images:
-                image_path = os.path.join(BEST_IMAGES_PATH, f"best_{section}.jpg")
+            image_path = os.path.join(BEST_IMAGES_PATH, f"best_{section}.jpg")
+            if section in best_images and os.path.exists(image_path):
+                logging.debug(f"Generating suggestions for {image_path}")
                 suggestions = generate_suggestions(image_path, section)
                 suggestions_results.append(suggestions)
+            else:
+                logging.warning(f"No best image found for {section}")
+                suggestions_results.append({
+                    "website_type": "e-commerce",
+                    "section_type": section,
+                    "suggestions": []
+                })
 
         return jsonify({
             "rankings": rankings_output.strip(),
