@@ -4,8 +4,8 @@ import google.generativeai as genai
 from PIL import Image
 import io
 import base64
-import playwright.sync_api
-from imagehash import phash
+import imgkit
+import imagehash
 import shutil
 from flask_cors import CORS
 import logging
@@ -40,37 +40,40 @@ os.makedirs(BEST_IMAGES_PATH, exist_ok=True)
 def get_similarity(img1_path, img2_path):
     try:
         with Image.open(img1_path) as img1, Image.open(img2_path) as img2:
-            hash1 = phash(img1)
-            hash2 = phash(img2)
+            hash1 = imagehash.phash(img1)
+            hash2 = imagehash.phash(img2)
         return 1 - (hash1 - hash2) / len(hash1.hash) ** 2
     except Exception as e:
         logging.error(f"Error comparing {img1_path} and {img2_path}: {e}")
         return 0
 
-# Segment webpage function
+# Segment webpage function using imgkit
 def segment_webpage(url, segment_type, url_index):
-    with playwright.sync_api.sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        try:
-            page.goto(url)
-            screenshot = page.screenshot(full_page=True)
-            with open(TEMP_IMAGE_PATH, "wb") as f:
-                f.write(screenshot)
-            
-            img = Image.open(TEMP_IMAGE_PATH)
-            if segment_type == 'header':
-                cropped = img.crop((0, 0, img.width, 100))
-            elif segment_type == 'body':
-                cropped = img.crop((0, 100, img.width, img.height - 100))
-            else:
-                cropped = img.crop((0, img.height - 100, img.width, img.height))
-            
-            output_path = os.path.join(INPUT_PATH, segment_type, f"url{url_index + 1}_{segment_type}.jpg")
-            cropped.save(output_path, "JPEG")
-            return output_path
-        finally:
-            browser.close()
+    try:
+        # Configure imgkit options for headless rendering
+        options = {
+            'format': 'png',
+            'quality': '75',
+            'quiet': '',  # Suppress output
+        }
+        # Capture the full webpage as an image
+        imgkit.from_url(url, TEMP_IMAGE_PATH, options=options)
+
+        # Open and crop the image
+        img = Image.open(TEMP_IMAGE_PATH)
+        if segment_type == 'header':
+            cropped = img.crop((0, 0, img.width, 100))
+        elif segment_type == 'body':
+            cropped = img.crop((0, 100, img.width, img.height - 100))
+        else:
+            cropped = img.crop((0, img.height - 100, img.width, img.height))
+
+        output_path = os.path.join(INPUT_PATH, segment_type, f"url{url_index + 1}_{segment_type}.jpg")
+        cropped.save(output_path, "JPEG")
+        return output_path
+    except Exception as e:
+        logging.error(f"Error processing {url} for {segment_type}: {e}")
+        raise
 
 def process_urls(url_list):
     for i, url in enumerate(url_list):
